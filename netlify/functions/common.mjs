@@ -1,0 +1,301 @@
+import { getStore } from "@netlify/blobs";
+
+export const REDS = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
+export const D2 = new Set(Array.from({length:12}, (_,i)=>i+13));
+export const D3 = new Set(Array.from({length:12}, (_,i)=>i+25));
+export const C1 = new Set([1,4,7,10,13,16,19,22,25,28,31,34]);
+export const C2 = new Set([2,5,8,11,14,17,20,23,26,29,32,35]);
+export const EX = new Set([6,15,24,33]);
+
+export const NORMAL_SPEED_MS = 2000;
+export const TURBO_SPEED_MS = 500;
+
+const store = () => getStore({ name: "roulette-demo", consistency: "strong" });
+
+export function defaultState(userId) {
+  return {
+    userId: String(userId),
+    balance: 1000,
+    startBalance: 1000,
+    unit: 1,
+    target: 50,
+    stoploss: 100,
+    stage: 1,
+    cyclePl: 0,
+    spins: 0,
+    cycles: 0,
+    wins: 0,
+    losses: 0,
+    peakBalance: 1000,
+    maxDrawdown: 0,
+    running: false,
+    runId: null,
+    speedMs: NORMAL_SPEED_MS,
+    pendingInput: null,
+    history: []
+  };
+}
+
+export async function getState(userId) {
+  const s = store();
+  const key = `user-${userId}`;
+  const value = await s.get(key, { type: "json" });
+  if (value) return value;
+  const fresh = defaultState(userId);
+  await s.setJSON(key, fresh);
+  return fresh;
+}
+
+export async function saveState(userId, state) {
+  await store().setJSON(`user-${userId}`, state);
+  return state;
+}
+
+export function stageInfo(stage, unit) {
+  if (stage === 1) return { risk: unit, title: "STEP 1 — RED" };
+  if (stage === 2) return { risk: 2*unit, title: "STEP 2 — DOZENS 2 + 3" };
+  if (stage === 3) return { risk: 14*unit, title: "STEP 3 — 28-NUMBER COVERAGE" };
+  return { risk: 3*unit, title: "STEP 4 — RED RECOVERY" };
+}
+
+export function resultFor(stage, n, unit) {
+  if (stage === 1) {
+    return REDS.has(n)
+      ? { pnl: unit, label: "RED WIN", nextStage: 1, complete: true }
+      : { pnl: -unit, label: "RED LOSS", nextStage: 2, complete: false };
+  }
+  if (stage === 2) {
+    return (D2.has(n) || D3.has(n))
+      ? { pnl: unit, label: "DOZEN WIN", nextStage: 1, complete: true }
+      : { pnl: -2*unit, label: "DOZEN LOSS", nextStage: 3, complete: false };
+  }
+  if (stage === 3) {
+    let pnl = -14*unit;
+    let label = "STEP 3 UNCOVERED LOSS";
+    if (C1.has(n)) { pnl += 18*unit; label = "COLUMN 1 WIN"; }
+    if (C2.has(n)) { pnl += 18*unit; label = "COLUMN 2 WIN"; }
+    if (EX.has(n)) { pnl += 18*unit; label = "STRAIGHT WIN"; }
+    return pnl > 0
+      ? { pnl, label, nextStage: 1, complete: true }
+      : { pnl, label, nextStage: 4, complete: false };
+  }
+  return REDS.has(n)
+    ? { pnl: 3*unit, label: "STEP 4 RED WIN", nextStage: 1, complete: true }
+    : { pnl: -3*unit, label: "STEP 4 RED LOSS", nextStage: 4, complete: false };
+}
+
+export async function executeSpin(userId, expectedRunId = null) {
+  let st = await getState(userId);
+
+  if (expectedRunId && (!st.running || st.runId !== expectedRunId)) {
+    return { stopped: true, state: st };
+  }
+
+  const stage = st.stage;
+  const unit = st.unit;
+  const { risk } = stageInfo(stage, unit);
+
+  if (st.balance + 1e-9 < risk) {
+    st.running = false;
+    st.runId = null;
+    await saveState(userId, st);
+    return { stopped: true, reason: "Insufficient demo balance for the next wager.", state: st };
+  }
+
+  const n = Math.floor(Math.random() * 37);
+  const r = resultFor(stage, n, unit);
+  const balance = st.balance + r.pnl;
+  const cyclePl = st.cyclePl + r.pnl;
+  const spins = st.spins + 1;
+  const cycles = st.cycles + (r.complete ? 1 : 0);
+  const wins = st.wins + (r.pnl > 0 ? 1 : 0);
+  const losses = st.losses + (r.pnl <= 0 ? 1 : 0);
+  const peakBalance = Math.max(st.peakBalance, balance);
+  const drawdown = Math.max(0, peakBalance - balance);
+  const maxDrawdown = Math.max(st.maxDrawdown, drawdown);
+
+  st = {
+    ...st,
+    balance,
+    stage: r.nextStage,
+    cyclePl: r.complete ? 0 : cyclePl,
+    spins, cycles, wins, losses,
+    peakBalance, maxDrawdown
+  };
+
+  const item = {
+    spin: spins,
+    number: n,
+    stage,
+    label: r.label,
+    pnl: r.pnl,
+    balance,
+    ts: Date.now()
+  };
+  st.history = [item, ...(st.history || [])].slice(0, 50);
+
+  const session = st.balance - st.startBalance;
+  let reason = null;
+  if (st.target > 0 && session >= st.target) {
+    st.running = false;
+    st.runId = null;
+    reason = `Profit target reached: ${fmtSigned(session)} credits.`;
+  } else if (st.stoploss > 0 && session <= -st.stoploss) {
+    st.running = false;
+    st.runId = null;
+    reason = `Stop target reached: ${fmtSigned(session)} credits.`;
+  }
+
+  // Check whether Stop/Reset changed runId while this spin was being calculated.
+  if (expectedRunId) {
+    const latest = await getState(userId);
+    if (latest.runId !== expectedRunId || !latest.running) {
+      st.running = false;
+      st.runId = null;
+    }
+  }
+
+  await saveState(userId, st);
+  return { state: st, result: item, reason };
+}
+
+export function fmt(n) { return Number(n).toFixed(2); }
+export function fmtSigned(n) { return `${n >= 0 ? "+" : ""}${Number(n).toFixed(2)}`; }
+
+export function statusText(st, result=null, reason=null) {
+  const session = st.balance - st.startBalance;
+  const total = st.wins + st.losses;
+  const wr = total ? (st.wins / total * 100) : 0;
+  const info = stageInfo(st.stage, st.unit);
+
+  let betLines = "";
+  if (st.stage === 1) betLines = "1 unit • Red";
+  else if (st.stage === 2) betLines = "1 unit • 2nd Dozen\n1 unit • 3rd Dozen\nTotal risk • 2 units";
+  else if (st.stage === 3) betLines = "6 units • Column 1\n6 units • Column 2\n0.5 each • 6 / 15 / 24 / 33\nTotal risk • 14 units";
+  else betLines = "3 units • Red";
+
+  let top = "";
+  if (result) {
+    top += `🎲 LAST SPIN: ${result.number}   (Spin #${result.spin})\n`;
+    top += `Step ${result.stage} — ${result.label}\n`;
+    top += `Spin P/L: ${fmtSigned(result.pnl)}\n────────────────────\n`;
+  }
+  if (reason) top += `⛔ ${reason}\n────────────────────\n`;
+
+  return top +
+`🎰 ROULETTE DEMO BOT
+────────────────────
+Balance     ${fmt(st.balance)}
+Session P/L ${fmtSigned(session)}
+Unit        ${fmt(st.unit)}
+Spins       ${st.spins}
+Cycles      ${st.cycles}
+Win Rate    ${wr.toFixed(1)}%
+Drawdown    ${fmt(st.maxDrawdown)}
+────────────────────
+${info.title}
+${betLines}
+Current risk • ${fmt(info.risk)}
+────────────────────
+Auto • ${st.running ? "RUNNING" : "STOPPED"}`;
+}
+
+export function statsText(st) {
+  const session = st.balance - st.startBalance;
+  const total = st.wins + st.losses;
+  const wr = total ? st.wins / total * 100 : 0;
+  return `📊 SESSION STATS
+
+Balance: ${fmt(st.balance)} credits
+Session P/L: ${fmtSigned(session)}
+Unit Size: ${fmt(st.unit)}
+Profit Target: +${fmt(st.target)}
+Stop Target: -${fmt(st.stoploss)}
+
+Spins: ${st.spins}
+Cycles: ${st.cycles}
+Wins: ${st.wins}
+Losses: ${st.losses}
+Win Rate: ${wr.toFixed(1)}%
+Max Drawdown: ${fmt(st.maxDrawdown)}
+
+Auto: ${st.running ? "RUNNING" : "STOPPED"}`;
+}
+
+export function historyText(st) {
+  const rows = (st.history || []).slice(0, 12);
+  if (!rows.length) return "🧾 HISTORY\n\nNo spins yet.";
+  return "🧾 LAST 12 SPINS\n\n" + rows.map(r =>
+    `#${r.spin} • ${r.number} • S${r.stage} • ${r.label} • ${fmtSigned(r.pnl)} • Bal ${fmt(r.balance)}`
+  ).join("\n");
+}
+
+export function mainKeyboard(st) {
+  const turbo = st.speedMs <= TURBO_SPEED_MS;
+  return {
+    inline_keyboard: [
+      [
+        { text: st.running ? "⏹ Stop Auto" : "▶️ Start Auto", callback_data: st.running ? "stop" : "start" },
+        { text: turbo ? "⚡ TURBO ON" : "⚡ Turbo Speed", callback_data: turbo ? "speed_normal" : "speed_turbo" }
+      ],
+      [
+        { text: "⚙️ Bet Settings", callback_data: "settings" },
+        { text: "📊 Stats", callback_data: "stats" }
+      ],
+      [
+        { text: "🧾 History", callback_data: "history" },
+        { text: "🔄 Reset", callback_data: "reset" }
+      ],
+      [
+        { text: "➕ Demo Deposit", callback_data: "deposit100" },
+        { text: "➖ Demo Withdraw", callback_data: "withdraw100" }
+      ]
+    ]
+  };
+}
+
+export function settingsKeyboard() {
+  return { inline_keyboard: [
+    [{ text: "💰 Unit Size", callback_data: "input_unit" }],
+    [{ text: "🎯 Profit Target", callback_data: "input_target" }],
+    [{ text: "🛑 Stop Target", callback_data: "input_stop" }],
+    [{ text: "🎰 Dashboard", callback_data: "dashboard" }]
+  ]};
+}
+
+export function viewKeyboard() {
+  return { inline_keyboard: [
+    [{ text: "🎰 Dashboard", callback_data: "dashboard" }],
+    [{ text: "📊 Stats", callback_data: "stats" }, { text: "🧾 History", callback_data: "history" }],
+    [{ text: "🔄 Reset Session", callback_data: "reset" }]
+  ]};
+}
+
+export function telegramApi(method, payload) {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) throw new Error("TELEGRAM_BOT_TOKEN is not configured.");
+  return fetch(`https://api.telegram.org/bot${token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(async r => {
+    const data = await r.json();
+    if (!data.ok) throw new Error(`Telegram ${method}: ${data.description || "unknown error"}`);
+    return data.result;
+  });
+}
+
+export async function safeEdit(chatId, messageId, text, replyMarkup) {
+  try {
+    await telegramApi("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: replyMarkup
+    });
+  } catch (e) {
+    if (!String(e.message).includes("message is not modified")) throw e;
+  }
+}
+
+export const sleep = ms => new Promise(r => setTimeout(r, ms));
