@@ -111,6 +111,7 @@ async function handleCallback(q) {
     st.runId = null;
     st.startBalance = st.balance;
     st.stage = 1;
+    st.deficit = 0;
     st.cyclePl = 0;
     st.spins = 0;
     st.cycles = 0;
