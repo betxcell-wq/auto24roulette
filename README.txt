@@ -1,5 +1,3 @@
-
-
 ROULETTE TELEGRAM DEMO BOT — NETLIFY V1
 =======================================
 
@@ -101,3 +99,15 @@ netlify/functions/common.mjs              Strategy/state/display functions
 netlify/functions/setup-webhook.mjs       One-time webhook registration
 netlify.toml                              Netlify configuration
 package.json                              Node dependency configuration
+
+
+V2 EXACT-RECOVERY STRATEGY UPDATE
+--------------------------------
+The previous 4-step Column/number recovery has been replaced with the exact alternating recovery system from roulette_red_dozens_exact_recovery_v7_drawdown_chart.html.
+
+Progression: 1 -> 2 -> 3 -> 12 -> 18 -> 72 -> 108 -> 432 ...
+Odd levels: Red.
+Even levels: 2nd + 3rd Dozens, total stake split equally.
+Any winning recovery spin resets to Level 1 (1 unit Red).
+Default recovery risk guard: 35% of current demo bankroll.
+Existing users are automatically migrated to Level 1 while preserving their demo balance and settings.
