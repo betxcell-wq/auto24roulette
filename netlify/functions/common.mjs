@@ -32,6 +32,8 @@ export function defaultState(userId) {
     runId: null,
     speedMs: NORMAL_SPEED_MS,
     pendingInput: null,
+    pendingWithdrawalAmount: null,
+    demoWithdrawals: [],
     history: []
   };
 }
@@ -63,6 +65,16 @@ export async function saveState(userId, state) {
   await store().setJSON(`user-${userId}`, state);
   return state;
 }
+
+export async function getWithdrawalQueue() {
+  return (await store().get("demo-withdrawal-queue", { type: "json" })) || [];
+}
+
+export async function saveWithdrawalQueue(queue) {
+  await store().setJSON("demo-withdrawal-queue", queue.slice(0, 200));
+  return queue;
+}
+
 
 export function unitsAt(stage, deficit = 0) {
   // Exact-recovery sequence from the reference simulator:
@@ -284,7 +296,11 @@ export function mainKeyboard(st) {
       ],
       [
         { text: "➕ Demo Deposit", callback_data: "deposit100" },
-        { text: "➖ Demo Withdraw", callback_data: "withdraw100" }
+        { text: "➖ Demo Withdraw", callback_data: "demo_withdraw" }
+      ],
+      [
+        { text: "₿ Support with BTC", callback_data: "btc_support" },
+        { text: "📋 Demo Withdrawals", callback_data: "demo_withdrawals" }
       ]
     ]
   };
