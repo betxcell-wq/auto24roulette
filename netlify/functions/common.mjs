@@ -3,9 +3,6 @@ import { getStore } from "@netlify/blobs";
 export const REDS = new Set([1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36]);
 export const D2 = new Set(Array.from({length:12}, (_,i)=>i+13));
 export const D3 = new Set(Array.from({length:12}, (_,i)=>i+25));
-export const C1 = new Set([1,4,7,10,13,16,19,22,25,28,31,34]);
-export const C2 = new Set([2,5,8,11,14,17,20,23,26,29,32,35]);
-export const EX = new Set([6,15,24,33]);
 
 export const NORMAL_SPEED_MS = 2000;
 export const TURBO_SPEED_MS = 500;
@@ -15,12 +12,15 @@ const store = () => getStore({ name: "roulette-demo", consistency: "strong" });
 export function defaultState(userId) {
   return {
     userId: String(userId),
+    strategyVersion: 2,
     balance: 1000,
     startBalance: 1000,
     unit: 1,
     target: 50,
     stoploss: 100,
     stage: 1,
+    deficit: 0,
+    maxRiskPct: 35,
     cyclePl: 0,
     spins: 0,
     cycles: 0,
@@ -40,7 +40,20 @@ export async function getState(userId) {
   const s = store();
   const key = `user-${userId}`;
   const value = await s.get(key, { type: "json" });
-  if (value) return value;
+  if (value) {
+    // Migrate users from the previous 4-step strategy without changing balance/settings.
+    if (value.strategyVersion !== 2) {
+      value.strategyVersion = 2;
+      value.stage = 1;
+      value.deficit = 0;
+      value.cyclePl = 0;
+      value.running = false;
+      value.runId = null;
+      value.maxRiskPct = value.maxRiskPct || 35;
+      await s.setJSON(key, value);
+    }
+    return value;
+  }
   const fresh = defaultState(userId);
   await s.setJSON(key, fresh);
   return fresh;
@@ -51,37 +64,43 @@ export async function saveState(userId, state) {
   return state;
 }
 
-export function stageInfo(stage, unit) {
-  if (stage === 1) return { risk: unit, title: "STEP 1 — RED" };
-  if (stage === 2) return { risk: 2*unit, title: "STEP 2 — DOZENS 2 + 3" };
-  if (stage === 3) return { risk: 14*unit, title: "STEP 3 — 28-NUMBER COVERAGE" };
-  return { risk: 3*unit, title: "STEP 4 — RED RECOVERY" };
+export function unitsAt(stage, deficit = 0) {
+  // Exact-recovery sequence from the reference simulator:
+  // 1 → 2 → 3 → 12 → 18 → 72 → 108 → 432 ...
+  if (stage === 1) return 1;
+  if (stage === 2) return 2;
+  if (stage === 3) return 3;
+  const isRed = stage % 2 === 1;
+  return isRed ? deficit : 2 * deficit;
 }
 
-export function resultFor(stage, n, unit) {
-  if (stage === 1) {
+export function stageInfo(stage, unit, deficit = 0) {
+  const units = unitsAt(stage, deficit);
+  const isRed = stage % 2 === 1;
+  return {
+    units,
+    risk: units * unit,
+    isRed,
+    title: isRed
+      ? `LEVEL ${stage} — RED`
+      : `LEVEL ${stage} — 2ND + 3RD DOZENS`
+  };
+}
+
+export function resultFor(stage, n, unit, deficit = 0) {
+  const info = stageInfo(stage, unit, deficit);
+  if (info.isRed) {
     return REDS.has(n)
-      ? { pnl: unit, label: "RED WIN", nextStage: 1, complete: true }
-      : { pnl: -unit, label: "RED LOSS", nextStage: 2, complete: false };
+      ? { pnl: info.risk, label: "RED WIN", complete: true }
+      : { pnl: -info.risk, label: "RED LOSS", complete: false };
   }
-  if (stage === 2) {
-    return (D2.has(n) || D3.has(n))
-      ? { pnl: unit, label: "DOZEN WIN", nextStage: 1, complete: true }
-      : { pnl: -2*unit, label: "DOZEN LOSS", nextStage: 3, complete: false };
-  }
-  if (stage === 3) {
-    let pnl = -14*unit;
-    let label = "STEP 3 UNCOVERED LOSS";
-    if (C1.has(n)) { pnl += 18*unit; label = "COLUMN 1 WIN"; }
-    if (C2.has(n)) { pnl += 18*unit; label = "COLUMN 2 WIN"; }
-    if (EX.has(n)) { pnl += 18*unit; label = "STRAIGHT WIN"; }
-    return pnl > 0
-      ? { pnl, label, nextStage: 1, complete: true }
-      : { pnl, label, nextStage: 4, complete: false };
-  }
-  return REDS.has(n)
-    ? { pnl: 3*unit, label: "STEP 4 RED WIN", nextStage: 1, complete: true }
-    : { pnl: -3*unit, label: "STEP 4 RED LOSS", nextStage: 4, complete: false };
+
+  // Total wager is split equally between the 2nd and 3rd dozens.
+  // A hit returns 3x the winning half, so net P/L = +half of total risk.
+  const hit = D2.has(n) || D3.has(n);
+  return hit
+    ? { pnl: info.risk / 2, label: "DOZENS WIN", complete: true }
+    : { pnl: -info.risk, label: "DOZENS LOSS", complete: false };
 }
 
 export async function executeSpin(userId, expectedRunId = null) {
@@ -91,9 +110,19 @@ export async function executeSpin(userId, expectedRunId = null) {
     return { stopped: true, state: st };
   }
 
-  const stage = st.stage;
+  const stage = st.stage || 1;
   const unit = st.unit;
-  const { risk } = stageInfo(stage, unit);
+  const deficit = Number(st.deficit || 0);
+  const { risk, units } = stageInfo(stage, unit, deficit);
+  const maxRiskPct = Number(st.maxRiskPct || 35);
+  const riskPct = st.balance > 0 ? (risk / st.balance * 100) : 100;
+
+  if (stage > 1 && riskPct > maxRiskPct) {
+    st.running = false;
+    st.runId = null;
+    await saveState(userId, st);
+    return { stopped: true, reason: `Recovery stopped: next wager is ${riskPct.toFixed(1)}% of bankroll, above the ${maxRiskPct}% limit.`, state: st };
+  }
 
   if (st.balance + 1e-9 < risk) {
     st.running = false;
@@ -103,7 +132,7 @@ export async function executeSpin(userId, expectedRunId = null) {
   }
 
   const n = Math.floor(Math.random() * 37);
-  const r = resultFor(stage, n, unit);
+  const r = resultFor(stage, n, unit, deficit);
   const balance = st.balance + r.pnl;
   const cyclePl = st.cyclePl + r.pnl;
   const spins = st.spins + 1;
@@ -117,7 +146,8 @@ export async function executeSpin(userId, expectedRunId = null) {
   st = {
     ...st,
     balance,
-    stage: r.nextStage,
+    stage: r.complete ? 1 : stage + 1,
+    deficit: r.complete ? 0 : deficit + units,
     cyclePl: r.complete ? 0 : cyclePl,
     spins, cycles, wins, losses,
     peakBalance, maxDrawdown
@@ -166,13 +196,15 @@ export function statusText(st, result=null, reason=null) {
   const session = st.balance - st.startBalance;
   const total = st.wins + st.losses;
   const wr = total ? (st.wins / total * 100) : 0;
-  const info = stageInfo(st.stage, st.unit);
+  const info = stageInfo(st.stage || 1, st.unit, Number(st.deficit || 0));
 
   let betLines = "";
-  if (st.stage === 1) betLines = "1 unit • Red";
-  else if (st.stage === 2) betLines = "1 unit • 2nd Dozen\n1 unit • 3rd Dozen\nTotal risk • 2 units";
-  else if (st.stage === 3) betLines = "6 units • Column 1\n6 units • Column 2\n0.5 each • 6 / 15 / 24 / 33\nTotal risk • 14 units";
-  else betLines = "3 units • Red";
+  if (info.isRed) {
+    betLines = `${info.units} unit${info.units === 1 ? "" : "s"} • Red`;
+  } else {
+    const half = info.units / 2;
+    betLines = `${half} units • 2nd Dozen\n${half} units • 3rd Dozen\nTotal risk • ${info.units} units`;
+  }
 
   let top = "";
   if (result) {
@@ -192,10 +224,11 @@ Spins       ${st.spins}
 Cycles      ${st.cycles}
 Win Rate    ${wr.toFixed(1)}%
 Drawdown    ${fmt(st.maxDrawdown)}
+Deficit     ${fmt((st.deficit || 0) * st.unit)}
 ────────────────────
 ${info.title}
 ${betLines}
-Current risk • ${fmt(info.risk)}
+Current risk • ${fmt(info.risk)} (${info.units}u)
 ────────────────────
 Auto • ${st.running ? "RUNNING" : "STOPPED"}`;
 }
@@ -218,6 +251,9 @@ Wins: ${st.wins}
 Losses: ${st.losses}
 Win Rate: ${wr.toFixed(1)}%
 Max Drawdown: ${fmt(st.maxDrawdown)}
+Recovery Level: ${st.stage || 1}
+Recovery Deficit: ${fmt((st.deficit || 0) * st.unit)}
+Max Recovery Risk: ${st.maxRiskPct || 35}% bankroll
 
 Auto: ${st.running ? "RUNNING" : "STOPPED"}`;
 }
@@ -226,7 +262,7 @@ export function historyText(st) {
   const rows = (st.history || []).slice(0, 12);
   if (!rows.length) return "🧾 HISTORY\n\nNo spins yet.";
   return "🧾 LAST 12 SPINS\n\n" + rows.map(r =>
-    `#${r.spin} • ${r.number} • S${r.stage} • ${r.label} • ${fmtSigned(r.pnl)} • Bal ${fmt(r.balance)}`
+    `#${r.spin} • ${r.number} • L${r.stage} • ${r.label} • ${fmtSigned(r.pnl)} • Bal ${fmt(r.balance)}`
   ).join("\n");
 }
 
