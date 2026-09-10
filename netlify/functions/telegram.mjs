@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import {
-  getState, saveState, statusText, statsText, historyText,
+  getState, saveState, getWithdrawalQueue, saveWithdrawalQueue, statusText, statsText, historyText,
   mainKeyboard, settingsKeyboard, viewKeyboard,
   telegramApi, safeEdit, NORMAL_SPEED_MS, TURBO_SPEED_MS
 } from "./common.mjs";
@@ -31,6 +31,48 @@ Choose the value you want to change:`;
   await safeEdit(chatId, messageId, text, settingsKeyboard());
 }
 
+const SUPPORT_BTC_ADDRESS = "bc1q6j50emprjgnckt7cd0cfjdlxklku5emdhg4x84tfk85885tpq72sqadeet";
+
+function demoWithdrawalText(st) {
+  const rows = (st.demoWithdrawals || []).slice(0, 10);
+  if (!rows.length) return "💸 DEMO WITHDRAWALS\n\nNo demo withdrawal requests yet.";
+  return "💸 DEMO WITHDRAWALS\n\n" + rows.map((w, i) =>
+    `${i + 1}. ${Number(w.amount).toFixed(2)} credits • ${w.status}\nTest address: ${w.address}`
+  ).join("\n\n") + "\n\n⚠️ Simulation only — no real BTC is owed or sent.";
+}
+
+function supportText() {
+  return `₿ SUPPORT WITH BITCOIN
+
+BTC address:
+${SUPPORT_BTC_ADDRESS}
+
+⚠️ Support payments are separate from the roulette demo. Sending BTC here does NOT add demo credits, create a wagering balance, or create any withdrawal entitlement.`;
+}
+
+function isAdmin(userId) {
+  return Boolean(process.env.ADMIN_TELEGRAM_ID) && String(process.env.ADMIN_TELEGRAM_ID) === String(userId);
+}
+
+function adminQueueText(queue) {
+  const rows = queue.slice(0, 10);
+  if (!rows.length) return "🛠 DEMO ADMIN QUEUE\n\nNo demo withdrawal requests.";
+  return "🛠 DEMO ADMIN QUEUE\n\n" + rows.map(w =>
+    `${w.id} • User ${w.userId}\n${Number(w.amount).toFixed(2)} credits • ${w.status}\n${w.address}`
+  ).join("\n\n") + "\n\nSimulation only. Status controls do not send BTC.";
+}
+
+function adminQueueKeyboard(queue) {
+  const pending = queue.filter(w => w.status === "PENDING (DEMO)").slice(0, 4);
+  const buttons = pending.map(w => [
+    { text: `✅ ${w.id}`, callback_data: `wa:${w.id}` },
+    { text: `❌ ${w.id}`, callback_data: `wr:${w.id}` },
+    { text: `🧪 Paid ${w.id}`, callback_data: `wp:${w.id}` }
+  ]);
+  buttons.push([{ text: "🎰 Dashboard", callback_data: "dashboard" }]);
+  return { inline_keyboard: buttons };
+}
+
 async function handleCallback(q) {
   const data = q.data;
   const userId = String(q.from.id);
@@ -39,6 +81,31 @@ async function handleCallback(q) {
   let st = await getState(userId);
 
   await telegramApi("answerCallbackQuery", { callback_query_id: q.id });
+
+  if (/^w[arp]:/.test(data)) {
+    if (!isAdmin(userId)) return safeEdit(chatId, messageId, "⛔ Admin access required.", viewKeyboard());
+    const [action, id] = data.split(":");
+    let queue = await getWithdrawalQueue();
+    const item = queue.find(w => w.id === id);
+    if (item) {
+      item.status = action === "wa" ? "APPROVED (DEMO)" : action === "wr" ? "REJECTED (DEMO)" : "MARKED PAID (DEMO)";
+      item.updatedAt = Date.now();
+      await saveWithdrawalQueue(queue);
+      const owner = await getState(item.userId);
+      const local = (owner.demoWithdrawals || []).find(w => w.id === id);
+      if (local) local.status = item.status;
+      // Rejected demo requests return the reserved demo credits.
+      if (action === "wr" && !item.refunded) {
+        owner.balance += Number(item.amount || 0);
+        item.refunded = true;
+        if (local) local.refunded = true;
+        await saveWithdrawalQueue(queue);
+      }
+      await saveState(item.userId, owner);
+    }
+    queue = await getWithdrawalQueue();
+    return safeEdit(chatId, messageId, adminQueueText(queue), adminQueueKeyboard(queue));
+  }
 
   if (data === "dashboard") {
     st.pendingInput = null;
@@ -125,6 +192,29 @@ async function handleCallback(q) {
     return safeEdit(chatId, messageId, "✅ Session reset.\n\n" + statusText(st), mainKeyboard(st));
   }
 
+  if (data === "btc_support") {
+    return safeEdit(chatId, messageId, supportText(), {
+      inline_keyboard: [
+        [{ text: "₿ Open Bitcoin Wallet", url: `bitcoin:${SUPPORT_BTC_ADDRESS}` }],
+        [{ text: "🎰 Dashboard", callback_data: "dashboard" }]
+      ]
+    });
+  }
+
+  if (data === "demo_withdraw") {
+    st.pendingInput = "withdraw_amount";
+    st.pendingWithdrawalAmount = null;
+    await saveState(userId, st);
+    return safeEdit(chatId, messageId,
+      "💸 DEMO WITHDRAWAL\n\nEnter the number of DEMO credits you want to withdraw.\n\nThis is a simulation and does not create a real BTC payout entitlement.",
+      { inline_keyboard: [[{ text: "⬅️ Cancel", callback_data: "dashboard" }]] }
+    );
+  }
+
+  if (data === "demo_withdrawals") {
+    return safeEdit(chatId, messageId, demoWithdrawalText(st), viewKeyboard());
+  }
+
   if (data === "deposit100") {
     st.balance += 100;
     st.peakBalance = Math.max(st.peakBalance, st.balance);
@@ -132,14 +222,6 @@ async function handleCallback(q) {
     return safeEdit(chatId, messageId, "✅ Demo deposit +100 credits.\n\n" + statusText(st), mainKeyboard(st));
   }
 
-  if (data === "withdraw100") {
-    if (st.balance < 100) {
-      return safeEdit(chatId, messageId, "⛔ Demo balance is below 100 credits.\n\n" + statusText(st), mainKeyboard(st));
-    }
-    st.balance -= 100;
-    await saveState(userId, st);
-    return safeEdit(chatId, messageId, "✅ Demo withdrawal -100 credits.\n\n" + statusText(st), mainKeyboard(st));
-  }
 }
 
 async function handleText(message) {
@@ -174,7 +256,41 @@ async function handleText(message) {
     });
   }
 
+  if (text === "/admin") {
+    if (!isAdmin(userId)) return telegramApi("sendMessage", { chat_id: chatId, text: "⛔ Admin access required." });
+    const queue = await getWithdrawalQueue();
+    return telegramApi("sendMessage", { chat_id: chatId, text: adminQueueText(queue), reply_markup: adminQueueKeyboard(queue) });
+  }
+
   if (!st.pendingInput) return;
+
+  if (st.pendingInput === "withdraw_address") {
+    const addr = text.replace(/\s+/g, "");
+    if (addr.length < 14 || addr.length > 90) {
+      return telegramApi("sendMessage", { chat_id: chatId, text: "Enter a BTC-style TEST address for the demo request." });
+    }
+    const amount = Number(st.pendingWithdrawalAmount || 0);
+    if (!(amount > 0) || amount > st.balance) {
+      st.pendingInput = null;
+      st.pendingWithdrawalAmount = null;
+      await saveState(userId, st);
+      return telegramApi("sendMessage", { chat_id: chatId, text: "Demo withdrawal amount is no longer available. Start the request again." });
+    }
+    st.balance -= amount;
+    const id = `W${Date.now().toString(36).slice(-6).toUpperCase()}`;
+    const request = { id, userId, amount, address: addr, status: "PENDING (DEMO)", ts: Date.now() };
+    st.demoWithdrawals = [request, ...(st.demoWithdrawals || [])].slice(0, 50);
+    const queue = await getWithdrawalQueue();
+    await saveWithdrawalQueue([request, ...queue]);
+    st.pendingInput = null;
+    st.pendingWithdrawalAmount = null;
+    await saveState(userId, st);
+    return telegramApi("sendMessage", {
+      chat_id: chatId,
+      text: `✅ Demo withdrawal request recorded: ${amount.toFixed(2)} credits.\n\n⚠️ Simulation only — this does not create a real BTC payout.\n\n${statusText(st)}`,
+      reply_markup: mainKeyboard(st)
+    });
+  }
 
   const value = Number(text.replaceAll("$","").replaceAll(",",""));
   if (!Number.isFinite(value) || value <= 0) {
@@ -185,7 +301,18 @@ async function handleText(message) {
   }
 
   let label;
-  if (st.pendingInput === "unit") {
+  if (st.pendingInput === "withdraw_amount") {
+    if (value > st.balance) {
+      return telegramApi("sendMessage", { chat_id: chatId, text: `Demo balance is only ${st.balance.toFixed(2)} credits.` });
+    }
+    st.pendingWithdrawalAmount = value;
+    st.pendingInput = "withdraw_address";
+    await saveState(userId, st);
+    return telegramApi("sendMessage", {
+      chat_id: chatId,
+      text: `Demo withdrawal amount: ${value.toFixed(2)} credits.\n\nNow enter a BTC-style TEST address to attach to this simulated request.\n\n⚠️ No real BTC will be sent.`
+    });
+  } else if (st.pendingInput === "unit") {
     if (value > 10000) return telegramApi("sendMessage", { chat_id: chatId, text: "Unit size is too large." });
     st.unit = value;
     label = `💰 Unit size changed to ${value.toFixed(2)} credits.`;
