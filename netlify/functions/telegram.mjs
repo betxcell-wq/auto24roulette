@@ -51,7 +51,10 @@ ${SUPPORT_BTC_ADDRESS}
 }
 
 function isAdmin(userId) {
-  return Boolean(process.env.ADMIN_TELEGRAM_ID) && String(process.env.ADMIN_TELEGRAM_ID) === String(userId);
+  const configured = String(process.env.ADMIN_TELEGRAM_ID || "").trim();
+  const incoming = String(userId || "").trim();
+
+  return configured.length > 0 && configured === incoming;
 }
 
 function adminQueueText(queue) {
@@ -256,11 +259,17 @@ async function handleText(message) {
     });
   }
 
-  if (text === "/admin") {
-    if (!isAdmin(userId)) return telegramApi("sendMessage", { chat_id: chatId, text: "⛔ Admin access required." });
-    const queue = await getWithdrawalQueue();
-    return telegramApi("sendMessage", { chat_id: chatId, text: adminQueueText(queue), reply_markup: adminQueueKeyboard(queue) });
-  }
+  if (text === "/myid") {
+  const configured = String(process.env.ADMIN_TELEGRAM_ID || "").trim();
+
+  return telegramApi("sendMessage", {
+    chat_id: chatId,
+    text:
+      `Your Telegram ID: ${userId}\n` +
+      `Admin ID configured: ${configured ? "YES" : "NO"}\n` +
+      `Admin match: ${isAdmin(userId) ? "YES" : "NO"}`
+  });
+}
 
   if (!st.pendingInput) return;
 
